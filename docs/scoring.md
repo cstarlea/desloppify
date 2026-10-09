@@ -118,6 +118,19 @@ When the project has a coverage report, measured line coverage takes over from t
 - A file missing from every report also keeps the graph's verdict. Coverage tools leave out both files that never loaded and files excluded on purpose, and the report can't tell the two apart.
 - Several reports are merged by covered line, so per-package reports in a monorepo and a root report from another run add up.
 
+### File health
+
+`structural` reports at most one issue per file (`structural::<file>`), listing every signal the file hits: large (500 lines or more), a complexity score, a god component (React hook counts), god classes and mixed concerns. Three or more signals make the issue tier 4 and high confidence; otherwise it is tier 3 and medium. A file whose only signal is complexity needs a score of 50.
+
+A class is a god class when it meets two of these rules:
+
+- 20 or more methods. Arrow-function fields count; accessors and overload signatures don't.
+- 7 or more constructor dependencies: constructor parameters plus fields set with Angular's `inject()`.
+- 40 or more decorators on the class, its methods and their parameters. Field decorators (ORM columns, validators, Angular inputs) declare a shape, so they don't count.
+- 300 or more lines.
+
+One rule alone isn't enough. NestJS services and Angular components routinely inject several collaborators, and a controller stacks decorators on every route. The classes are listed in the issue's `detail.god_classes` (`desloppify detect gods` shows them).
+
 ### Type checks
 
 `type_error` reports what tsc reports, read from the same tsc run as `unused` (`detectors/tsc.py` runs tsc once per scan with `--noUnusedLocals --noUnusedParameters --listFiles`; those flags only add the unused diagnostics, which `type_error` leaves out). Its potential is the number of files tsc checked in the scan path, from `--listFiles`. One issue covers one error code on one line, with ID `type_error::<file>::TS<code>::<line>`.
@@ -151,7 +164,7 @@ When a linter doesn't run (not installed, dependencies not installed, a config o
 
 Knip runs once per scan (`detectors/knip_adapter.py`, cached like tsc), and only when the project installs it: desloppify never downloads it. In a monorepo it runs from the workspace root, with `--workspace` when the scan path is one package. Three detectors read the run, all under Code quality:
 
-- `exports` reports Knip's unused exports and types (`exports::<file>::<name>`), unused enum members (`exports::<file>::<Enum>.<Member>`) and duplicate exports, one name exported under several (`exports::<file>::<a>=<b>`, tier 3, medium confidence). A deprecated alias isn't a duplicate (it's kept on purpose, and `deprecated` reports it), nor is an alias already reported as an unused export.
+- `exports` reports Knip's unused exports and types (`exports::<file>::<name>`), unused enum members (`exports::<file>::<Enum>.<Member>`) and duplicate exports, one name exported under several (`exports::<file>::<a>=<b>`, tier 3, medium confidence). A deprecated alias isn't a duplicate (it's kept on purpose, and `deprecated` reports it), nor is an alias already reported as an unused export. A published package's public API isn't unused just because nothing in the repo imports it: an export (or the enum holding a member) that a non-private package's `exports`, `main`, `module` or `types` entry exposes, directly or through re-exports, isn't reported (`deps/public_api.py`, which needs tree-sitter). Unused exports in apps, private packages and modules no entry re-exports are still reported.
 - `orphaned` uses Knip's unused files as corroboration and reports nothing new. An orphan Knip also reports goes from medium to high confidence, unless an import Knip can't resolve either may point at it. An orphan Knip doesn't report is a file it reaches from an entry point it knows (a plugin's config, a manifest field) or one its config ignores, so it drops to low confidence.
 - `dependencies` checks the manifests (`package.json`) nearest the scanned sources, inside the scan path. Its potential is the number of dependencies and devDependencies they declare, plus the number of unlisted packages. IDs are `dependencies::<package.json>::<kind>::<package>`:
   - `unused`, a dependency nothing uses (tier 2, high confidence), and `unused_dev`, the same for a devDependency (tier 3, medium confidence, since tools Knip has no plugin for use them);

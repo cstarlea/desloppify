@@ -14,6 +14,7 @@ from desloppify.languages._framework.base.types import (
     DetectorPhase,
     LangConfig,
     LangSecurityResult,
+    LangValueSpec,
 )
 from desloppify.languages._framework.frameworks.phases import framework_phases
 from desloppify.languages.typescript import test_coverage as ts_test_coverage_hooks
@@ -87,8 +88,8 @@ def _ts_extract_functions(path):
 
 
 class TypeScriptConfig(LangConfig):
-    def detect_lang_security_detailed(self, files, zone_map):
-        result = detect_ts_security(files, zone_map)
+    def detect_lang_security_detailed(self, files, zone_map, settings=None):
+        result = detect_ts_security(files, zone_map, settings)
         return LangSecurityResult(
             entries=result.entries,
             files_scanned=result.population_size,
@@ -146,6 +147,14 @@ class TypeScriptConfig(LangConfig):
             migration_mixed_extensions=TS_MIGRATION_MIXED_EXTENSIONS,
             extract_functions=_ts_extract_functions,
             zone_rules=TS_ZONE_RULES,
+            setting_specs={
+                "auth_functions": LangValueSpec(
+                    list,
+                    [],
+                    "Extra function names that count as an auth or session check "
+                    "in server actions and route handlers",
+                ),
+            },
         )
 
 

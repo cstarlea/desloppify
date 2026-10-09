@@ -30,6 +30,8 @@ _CONSTANT_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _LITERAL_TYPES = frozenset({"string", "number", "true", "false", "null", "undefined", "regex"})
 _FUNCTION_TYPES = frozenset({"function_declaration", "function_expression", "function", "arrow_function"})
 # ``ids.map(() => '?').join(',')``: a list of placeholders, not a value.
+_NUMERIC_TYPES = frozenset({"number", "bigint", "boolean"})
+_NUMERIC_CALLS = frozenset({"Number", "parseInt", "parseFloat", "BigInt", "Number.parseInt", "Number.parseFloat"})
 _PLACEHOLDER_LITERAL_RE = re.compile(r"""['"`]\s*(?:\?|\$\d*|:\w+)\s*['"`]""")
 
 
@@ -38,13 +40,14 @@ class _Scope:
     """Name lookups for one parsed file."""
 
     parsed: ParsedSource
+    path: Path | None = None
     declarations: dict[str, list] = field(default_factory=dict)  # name -> declarators
     top_functions: dict[str, object] = field(default_factory=dict)  # name -> function node
     imported: dict[str, str] = field(default_factory=dict)  # local name -> module
 
     @classmethod
-    def build(cls, parsed: ParsedSource) -> _Scope:
-        scope = cls(parsed)
+    def build(cls, parsed: ParsedSource, path: Path | None = None) -> _Scope:
+        scope = cls(parsed, path)
         for node in q.descendants(parsed.root, ("variable_declarator",)):
             name = node.child_by_field_name("name")
             if name is not None and name.type == "identifier":
@@ -138,16 +141,37 @@ def _is_constant(scope: _Scope, node, depth: int = 0) -> bool:
             return True
         value = scope.initializer(name, node)
         if value is None:
-            return False
+            return _parameter_type(scope, name, node) in _NUMERIC_TYPES
         text = parsed.text(value)
         if ".join(" in text and _PLACEHOLDER_LITERAL_RE.search(text):
             return True
         return _is_constant(scope, value, depth + 1)
+    if kind == "call_expression":
+        function = node.child_by_field_name("function")
+        callee = parsed.text(function) if function is not None else ""
+        return callee in _NUMERIC_CALLS or callee.startswith("Math.")
     if kind == "member_expression":
+        if parsed.text(node.child_by_field_name("property") or node) == "length":
+            return True
         return any(_CONSTANT_NAME_RE.match(part) for part in parsed.text(node).split(".")[:1]) or bool(
             _CONSTANT_NAME_RE.match(parsed.text(node.child_by_field_name("property") or node))
         )
     return False
+
+
+def _parameter_type(scope: _Scope, name: str, use) -> str | None:
+    """The annotated type of the parameter ``name`` that ``use`` refers to."""
+    holder = _enclosing_function(use)
+    while holder is not None:
+        params = holder.child_by_field_name("parameters")
+        for param in params.named_children if params is not None else ():
+            pattern = param.child_by_field_name("pattern")
+            if pattern is None or pattern.type != "identifier" or scope.parsed.text(pattern) != name:
+                continue
+            annotation = param.child_by_field_name("type")
+            return scope.parsed.text(annotation).lstrip(":").strip() if annotation is not None else None
+        holder = _enclosing_function(holder)
+    return None
 
 
 def _interpolated(scope: _Scope, node, depth: int = 0):
@@ -343,7 +367,7 @@ def _is_child_process_require(scope: _Scope, node) -> bool:
     return bool(values) and q.string_value(scope.parsed, values[0]) in _CHILD_PROCESS_MODULES
 
 
-def _process_bindings(scope: _Scope) -> _ProcessBindings:
+def _process_bindings(scope: _Scope, *, follow_imports: bool = True) -> _ProcessBindings:
     parsed = scope.parsed
     found = _ProcessBindings()
 
@@ -354,7 +378,13 @@ def _process_bindings(scope: _Scope) -> _ProcessBindings:
             found.spawn[local] = imported
 
     for info in q.imports(parsed):
-        if info.source not in _CHILD_PROCESS_MODULES or info.type_only:
+        if info.type_only:
+            continue
+        if info.source.startswith(".") and follow_imports:
+            for local, imported in _imported_shell_functions(scope, info):
+                found.shell[local] = imported
+            continue
+        if info.source not in _CHILD_PROCESS_MODULES:
             continue
         for binding in info.bindings:
             if binding.imported in ("default", "*", "="):
@@ -397,6 +427,48 @@ def _process_bindings(scope: _Scope) -> _ProcessBindings:
             if target in _SHELL_FUNCTIONS:
                 found.shell[parsed.text(name)] = target
     return found
+
+
+_LOCAL_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+
+
+def _resolve_local_module(base: Path, source: str) -> Path | None:
+    target = (base.parent / source).resolve()
+    stem = target.with_suffix("") if target.suffix in (".js", ".mjs", ".cjs", ".jsx") else target
+    for candidate in (
+        target,
+        *(stem.with_name(stem.name + suffix) for suffix in _LOCAL_SUFFIXES),
+        *(target / f"index{suffix}" for suffix in _LOCAL_SUFFIXES),
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _imported_shell_functions(scope: _Scope, info) -> list[tuple[str, str]]:
+    """``(local, exec)`` for each name imported from a local module that exports a
+    shell function (``export const run = promisify(exec)``); one hop only."""
+    if scope.path is None or not info.bindings:
+        return []
+    module = _resolve_local_module(scope.path, info.source)
+    other = parsed_file(module) if module is not None else None
+    if other is None or b"child_process" not in other.source:
+        return []
+    other_scope = _Scope.build(other, module)
+    shell = _process_bindings(other_scope, follow_imports=False).shell
+    if not shell:
+        return []
+    exported: dict[str, str] = {}
+    for export in q.exports(other):
+        if export.kind in ("declaration", "named"):
+            for binding in export.bindings:
+                if binding.name in shell:
+                    exported[binding.exported] = shell[binding.name]
+    return [
+        (binding.local, exported[binding.imported])
+        for binding in info.bindings
+        if not binding.type_only and binding.imported in exported
+    ]
 
 
 def _process_function(scope: _Scope, found: _ProcessBindings, node) -> str | None:
@@ -565,7 +637,8 @@ def _directives(parsed: ParsedSource, block) -> set[str]:
 
 def _resolve_export_value(scope: _Scope, value, depth: int = 0) -> tuple[object | None, object | None] | None:
     """``(function, wrapper_call)`` behind an exported value, or None when it
-    isn't a function written here (a builder chain, a re-export, an import)."""
+    isn't a function written here (a re-export, an import). A builder chain
+    ending in a callback (``procedure.mutation(async () => …)``) is a wrapper call."""
     value = _unwrap(value)
     if value is None or depth > 2:
         return None
@@ -589,7 +662,7 @@ def _candidates(scope: _Scope, normalized_path: str) -> list[_Candidate]:
     parsed = scope.parsed
     module_server = "use server" in _directives(parsed, parsed.root)
     is_route = bool(_ROUTE_FILE_RE.search(normalized_path))
-    if not (module_server or is_route or "use server" in parsed.source.decode("utf-8", "replace")):
+    if not (module_server or is_route or b"use server" in parsed.source):
         return []
     found: list[_Candidate] = []
 
@@ -663,6 +736,11 @@ def _has_auth(scope: _Scope, node, auth_names: frozenset[str], seen: set[int], d
     return False
 
 
+def _is_name(scope: _Scope, node, name: str) -> bool:
+    node = _unwrap(node)
+    return node is not None and node.type == "identifier" and scope.parsed.text(node) == name
+
+
 def _delegates_request(scope: _Scope, function) -> bool:
     """A handler that hands its request to another function, which may check it."""
     params = function.child_by_field_name("parameters")
@@ -679,11 +757,11 @@ def _delegates_request(scope: _Scope, function) -> bool:
             arg = _unwrap(arg)
             if arg is None:
                 continue
-            if arg.type == "identifier" and scope.parsed.text(arg) == request:
+            if _is_name(scope, arg, request):
                 return True
             if arg.type == "object" and any(
                 (p.type == "shorthand_property_identifier" and scope.parsed.text(p) == request)
-                or (p.type == "pair" and scope.parsed.text(_unwrap(p.child_by_field_name("value"))) == request)
+                or (p.type == "pair" and _is_name(scope, p.child_by_field_name("value"), request))
                 for p in arg.named_children
             ):
                 return True
@@ -892,7 +970,7 @@ def backend_security_issues(
     parsed = parsed_file(filepath)
     if parsed is None:
         return []
-    scope = _Scope.build(parsed)
+    scope = _Scope.build(parsed, Path(resolve_path(filepath)))
     namer = _Namer(parsed)
     return [
         *_sql_issues(scope, filepath, lines, namer),

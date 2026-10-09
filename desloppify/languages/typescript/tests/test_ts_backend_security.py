@@ -98,6 +98,9 @@ def test_sql_parameters_and_constants_are_not_reported(tmp_path):
                 "  await prisma.$queryRawUnsafe('SELECT * FROM users WHERE id = $1', id);\n"
                 "  await prisma.$queryRawUnsafe(query, id);\n"  # unknown variable: not reported
                 "}\n"
+                "export function page(db, limit: number, offset: string, ids: string[]) {\n"
+                "  return db.query(`SELECT * FROM t LIMIT ${limit} OFFSET ${Number(offset)} -- ${ids.length}`);\n"
+                "}\n"
             )
         },
     )
@@ -164,6 +167,32 @@ def test_shell_commands_built_from_values_are_reported(tmp_path):
         "shell_injection::go:childProcess.exec",
     ]
     assert {e["confidence"] for e in entries} == {"high"}
+
+
+def test_shell_wrapper_from_a_local_module_is_followed(tmp_path):
+    entries = _scan(
+        tmp_path,
+        {
+            "lib/execa.ts": (
+                "import { exec, execFile } from 'node:child_process';\n"
+                "import { promisify } from 'node:util';\n"
+                "export const execa = promisify(exec);\n"
+                "export const run = promisify(execFile);\n"
+            ),
+            "lib/pkg.ts": (
+                "import { execa, run } from './execa';\n"
+                "import { other } from './other';\n"
+                "export async function install(name: string) {\n"
+                "  await execa(`npm install ${name}`);\n"
+                "  await run(`npm`, ['install', name]);\n"
+                "  await other(`npm install ${name}`);\n"
+                "}\n"
+            ),
+            "lib/other.ts": "export async function other(cmd: string) { return cmd; }\n",
+        },
+    )
+    assert _names(entries) == ["shell_injection::install:execa"]
+    assert entries[0]["file"].endswith("lib/pkg.ts")
 
 
 def test_shell_safe_forms_are_not_reported(tmp_path):
